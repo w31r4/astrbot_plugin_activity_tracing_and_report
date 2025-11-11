@@ -7,7 +7,7 @@ import sqlite3
 from collections import defaultdict, deque
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
-from typing import Any, Deque, Iterable
+from typing import TYPE_CHECKING, Any, Deque, Iterable, cast
 
 import astrbot.api.message_components as Comp
 from astrbot.api import logger
@@ -16,6 +16,9 @@ from astrbot.api.star import Context, Star, register
 from astrbot.core.message.message_event_result import MessageEventResult
 from astrbot.core.star.filter.command import GreedyStr
 from astrbot.core.utils.astrbot_path import get_astrbot_data_path
+
+if TYPE_CHECKING:
+    from astrbot.core.star.register.star_handler import RegisteringCommandable
 
 
 @dataclass
@@ -58,19 +61,13 @@ class ForecastRule:
             "threshold": self.threshold,
             "window_hours": self.window_hours,
             "cooldown_minutes": self.cooldown_minutes,
-            "last_triggered": self.last_triggered.isoformat()
-            if self.last_triggered
-            else None,
+            "last_triggered": self.last_triggered.isoformat() if self.last_triggered else None,
         }
 
     @staticmethod
     def from_dict(data: dict) -> ForecastRule:
         last = data.get("last_triggered")
-        last_dt = (
-            datetime.fromisoformat(last).astimezone(timezone.utc)
-            if last
-            else None
-        )
+        last_dt = datetime.fromisoformat(last).astimezone(timezone.utc) if last else None
         return ForecastRule(
             label=data["label"],
             target_id=data["target_id"],
@@ -187,13 +184,19 @@ class ActivityTracingPlugin(Star):
     @filter.command_group("activity")
     def activity(self):
         """活动追踪"""
+        return None
 
-    @activity.command_group("forecast")
+    activity = cast("RegisteringCommandable", activity)
+
+    @activity.group("forecast")  # type: ignore [attr-defined]
     def activity_forecast(self):
         """展望未来"""
+        return None
+
+    activity_forecast = cast("RegisteringCommandable", activity_forecast)
 
     @filter.permission_type(filter.PermissionType.ADMIN)
-    @activity_forecast.command("add")
+    @activity_forecast.command("add")  # type: ignore [attr-defined]
     async def forecast_add(
         self,
         event: AstrMessageEvent,
@@ -239,7 +242,7 @@ class ActivityTracingPlugin(Star):
         )
 
     @filter.permission_type(filter.PermissionType.ADMIN)
-    @activity_forecast.command("rm")
+    @activity_forecast.command("rm")  # type: ignore [attr-defined]
     async def forecast_remove(self, event: AstrMessageEvent, label: str | None = None):
         rules = self.forecast_rules.get(event.unified_msg_origin, {})
         if not label:
@@ -252,7 +255,7 @@ class ActivityTracingPlugin(Star):
         self._save_forecast_rules()
         yield event.plain_result(f"已删除规则 {label}。")
 
-    @activity_forecast.command("ls")
+    @activity_forecast.command("ls")  # type: ignore [attr-defined]
     async def forecast_list(self, event: AstrMessageEvent):
         rules = self.forecast_rules.get(event.unified_msg_origin, {})
         if not rules:
@@ -267,7 +270,7 @@ class ActivityTracingPlugin(Star):
         yield event.plain_result("\n".join(lines))
 
     @filter.permission_type(filter.PermissionType.ADMIN)
-    @activity.command("watch")
+    @activity.command("watch")  # type: ignore [attr-defined]
     async def activity_watch(self, event: AstrMessageEvent, target: str | None = None):
         """管理员指定监听对象并立即回溯最近 2000 条消息。"""
         session_id = event.unified_msg_origin
@@ -306,7 +309,7 @@ class ActivityTracingPlugin(Star):
         )
 
     @filter.permission_type(filter.PermissionType.ADMIN)
-    @activity.command("drop")
+    @activity.command("drop")  # type: ignore [attr-defined]
     async def activity_drop(self, event: AstrMessageEvent, target: str | None = None):
         """停止监听某个群友。"""
         session_id = event.unified_msg_origin
@@ -321,7 +324,7 @@ class ActivityTracingPlugin(Star):
             return
         yield event.plain_result(f"已停止监听 {target_id}，缓存数据将很快被回收。")
 
-    @activity.command("list")
+    @activity.command("list")  # type: ignore [attr-defined]
     async def activity_list(self, event: AstrMessageEvent):
         """查看当前会话的所有监听对象。"""
         session_id = event.unified_msg_origin
@@ -333,17 +336,13 @@ class ActivityTracingPlugin(Star):
         lines = ["监听对象："]
         for target_id, state in targets.items():
             total = len(state.records)
-            freshness = (
-                self._fmt_delta(now - state.last_updated)
-                if state.last_updated
-                else "未收到发言"
-            )
+            freshness = self._fmt_delta(now - state.last_updated) if state.last_updated else "未收到发言"
             lines.append(
                 f"- ID {target_id} | 记录 {total} 条 | 最近 {freshness} | 回溯{'✓' if state.backfilled else '×'}",
             )
         yield event.plain_result("\n".join(lines))
 
-    @activity.command("snapshot")
+    @activity.command("snapshot")  # type: ignore [attr-defined]
     async def activity_snapshot(
         self,
         event: AstrMessageEvent,
@@ -369,7 +368,7 @@ class ActivityTracingPlugin(Star):
         snapshot = self._build_snapshot(window_records, window_hours)
         yield event.plain_result(snapshot)
 
-    @activity.command("rewind")
+    @activity.command("rewind")  # type: ignore [attr-defined]
     async def activity_rewind(
         self,
         event: AstrMessageEvent,
@@ -397,7 +396,7 @@ class ActivityTracingPlugin(Star):
             return
         local_tz = datetime.now().astimezone().tzinfo
         start = start_local.replace(tzinfo=local_tz).astimezone(timezone.utc)
-        end = (start + timedelta(days=1))
+        end = start + timedelta(days=1)
 
         matches = self._query_history_db(
             event.unified_msg_origin,
@@ -420,9 +419,7 @@ class ActivityTracingPlugin(Star):
             return
 
         name = self.user_names.get(target_id, target_id)
-        header = (
-            f"【回到过去】{name} 在 {day_text} 提及 '{query_text}' 的记录（共 {len(matches)} 条）"
-        )
+        header = f"【回到过去】{name} 在 {day_text} 提及 '{query_text}' 的记录（共 {len(matches)} 条）"
         lines = [header]
         for rec in matches[:20]:
             local_time = rec["timestamp"].astimezone().strftime("%H:%M")
@@ -434,7 +431,7 @@ class ActivityTracingPlugin(Star):
             lines.append("...（已截断，更多内容可在索引数据库中查询）")
         yield event.plain_result("\n".join(lines))
 
-    @activity.command("ask")
+    @activity.command("ask")  # type: ignore
     async def activity_ask(
         self,
         event: AstrMessageEvent,
@@ -465,9 +462,7 @@ class ActivityTracingPlugin(Star):
 
         coverage = self._describe_coverage(state)
         time_hint = self._format_time_focus(time_focus)
-        rag_context = "\n".join(
-            f"[{chunk['timestamp']}] {chunk['snippet']}" for chunk in rag_chunks
-        )
+        rag_context = "\n".join(f"[{chunk['timestamp']}] {chunk['snippet']}" for chunk in rag_chunks)
         system_prompt = (
             "你是多智能体协同分析器，协调“观察员”“时间线校准员”“推理官”三个视角。"
             "阅读提供的原始片段后，分三步输出："
@@ -781,11 +776,7 @@ class ActivityTracingPlugin(Star):
         count = len(records)
         first = records[0].timestamp
         last = records[-1].timestamp
-        question_count = sum(
-            1
-            for msg in records
-            if msg.content.endswith("?") or msg.content.endswith("？")
-        )
+        question_count = sum(1 for msg in records if msg.content.endswith("?") or msg.content.endswith("？"))
         pos_hits = self._count_hits(records, self.positive_keywords)
         neg_hits = self._count_hits(records, self.negative_keywords)
         topics = self._count_hits(records, self.activity_keywords)
@@ -953,8 +944,7 @@ class ActivityTracingPlugin(Star):
                 continue
             snippet_records = self._collect_context_window(history, idx, self.context_span)
             snippet = "\n".join(
-                f"{self._fmt_ts(rec.timestamp)} {rec.sender_name}: {rec.content}"
-                for rec in snippet_records
+                f"{self._fmt_ts(rec.timestamp)} {rec.sender_name}: {rec.content}" for rec in snippet_records
             )
             scored.append(
                 {
@@ -978,11 +968,7 @@ class ActivityTracingPlugin(Star):
                     current = []
         if current:
             tokens.append("".join(current))
-        bigrams = {
-            text[i : i + 2]
-            for i in range(len(text) - 1)
-            if self._is_cjk(text[i]) and self._is_cjk(text[i + 1])
-        }
+        bigrams = {text[i : i + 2] for i in range(len(text) - 1) if self._is_cjk(text[i]) and self._is_cjk(text[i + 1])}
         return tokens + list(bigrams)
 
     def _is_token_char(self, ch: str) -> bool:
