@@ -5,9 +5,10 @@ import json
 import os
 import sqlite3
 from collections import defaultdict, deque
+from collections.abc import Iterable
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
-from typing import TYPE_CHECKING, Any, Deque, Iterable, cast
+from typing import TYPE_CHECKING, Any, cast
 
 import astrbot.api.message_components as Comp
 from astrbot.api import logger
@@ -29,18 +30,68 @@ class SessionMessage:
     timestamp: datetime
     channel_id: str
 
+    def to_dict(self) -> dict:
+        return {
+            "sender_id": self.sender_id,
+            "sender_name": self.sender_name,
+            "content": self.content,
+            "timestamp": self.timestamp.isoformat(),
+            "channel_id": self.channel_id,
+        }
+
+    @staticmethod
+    def from_dict(data: dict) -> SessionMessage:
+        return SessionMessage(
+            sender_id=data["sender_id"],
+            sender_name=data["sender_name"],
+            content=data["content"],
+            timestamp=datetime.fromisoformat(data["timestamp"]),
+            channel_id=data["channel_id"],
+        )
+
 
 @dataclass
 class TargetState:
     target_id: str
     session_id: str
     platform_id: str
-    records: Deque[SessionMessage] = field(
+    records: deque[SessionMessage] = field(
         default_factory=lambda: deque(),  # FIFO, manual trimming
     )
     created_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
     last_updated: datetime | None = None
     backfilled: bool = False
+
+    def to_dict(self) -> dict:
+        """将状态序列化为字典，不包含消息记录。"""
+        return {
+            "target_id": self.target_id,
+            "session_id": self.session_id,
+            "platform_id": self.platform_id,
+            "created_at": self.created_at.isoformat(),
+            "last_updated": self.last_updated.isoformat()
+            if self.last_updated
+            else None,
+            "backfilled": self.backfilled,
+        }
+
+    @staticmethod
+    def from_dict(data: dict) -> TargetState:
+        """从字典反序列化为状态对象。"""
+        created_at = datetime.fromisoformat(data["created_at"])
+        last_updated = (
+            datetime.fromisoformat(data["last_updated"])
+            if data.get("last_updated")
+            else None
+        )
+        return TargetState(
+            target_id=data["target_id"],
+            session_id=data["session_id"],
+            platform_id=data["platform_id"],
+            created_at=created_at,
+            last_updated=last_updated,
+            backfilled=data.get("backfilled", False),
+        )
 
 
 @dataclass
@@ -61,13 +112,17 @@ class ForecastRule:
             "threshold": self.threshold,
             "window_hours": self.window_hours,
             "cooldown_minutes": self.cooldown_minutes,
-            "last_triggered": self.last_triggered.isoformat() if self.last_triggered else None,
+            "last_triggered": self.last_triggered.isoformat()
+            if self.last_triggered
+            else None,
         }
 
     @staticmethod
     def from_dict(data: dict) -> ForecastRule:
         last = data.get("last_triggered")
-        last_dt = datetime.fromisoformat(last).astimezone(timezone.utc) if last else None
+        last_dt = (
+            datetime.fromisoformat(last).astimezone(timezone.utc) if last else None
+        )
         return ForecastRule(
             label=data["label"],
             target_id=data["target_id"],
@@ -90,8 +145,8 @@ class ActivityTracingPlugin(Star):
 
     def __init__(self, context: Context):
         super().__init__(context)
-        self.session_histories: dict[str, Deque[SessionMessage]] = defaultdict(deque)
-        self.session_hash_sequences: dict[str, Deque[str]] = defaultdict(deque)
+        self.session_histories: dict[str, deque[SessionMessage]] = defaultdict(deque)
+        self.session_hash_sequences: dict[str, deque[str]] = defaultdict(deque)
         self.session_hash_sets: dict[str, set[str]] = defaultdict(set)
         self.tracked_targets: dict[str, dict[str, TargetState]] = defaultdict(dict)
         self.user_names: dict[str, str] = {}
@@ -100,6 +155,12 @@ class ActivityTracingPlugin(Star):
         self.forecast_store_path = os.path.join(
             data_root,
             "activity_forecast_rules.json",
+        )
+        self.targets_store_path = os.path.join(
+            data_root, "activity_tracked_targets.json"
+        )
+        self.sessions_store_path = os.path.join(
+            data_root, "activity_session_histories.json"
         )
         self.forecast_rules: dict[str, dict[str, ForecastRule]] = defaultdict(dict)
 
@@ -118,7 +179,7 @@ class ActivityTracingPlugin(Star):
             "期待",
             "棒",
             "舒服",
-            "升职",
+            "升職",
             "爽",
             "上岸",
         ]
@@ -136,18 +197,38 @@ class ActivityTracingPlugin(Star):
             "感冒",
             "发烧",
         ]
-        self.activity_keywords = ["吃饭", "聚餐", "打游戏", "上号", "排位", "开黑", "出差", "加班"]
+        self.activity_keywords = [
+            "吃饭",
+            "聚餐",
+            "打游戏",
+            "上号",
+            "排位",
+            "开黑",
+            "出差",
+            "加班",
+        ]
 
     async def initialize(self):
-        self._load_forecast_rules()
+        await self._load_forecast_rules()
+        await self._load_session_histories()
+        await self._load_tracked_targets()
+        # 重建索引
+        for session_id, history in self.session_histories.items():
+            for msg in history:
+                self._rebuild_indexes(session_id, msg)
+        for session_id, targets in self.tracked_targets.items():
+            for target_id, state in targets.items():
+                self._reindex_target(state)
 
     async def terminate(self):
-        """清理内存索引。"""
+        """清理内存索引并持久化状态。"""
+        await self._save_forecast_rules()
+        await self._save_tracked_targets()
+        await self._save_session_histories()
         self.session_histories.clear()
         self.session_hash_sequences.clear()
         self.session_hash_sets.clear()
         self.tracked_targets.clear()
-        self._save_forecast_rules()
 
     @filter.event_message_type(filter.EventMessageType.ALL)
     async def capture_message_stream(self, event: AstrMessageEvent):
@@ -217,7 +298,9 @@ class ActivityTracingPlugin(Star):
         if not keyword_text:
             yield event.plain_result("请提供用来判断事件的关键词，多个可用空格分隔。")
             return
-        word_list = [w.strip() for w in keyword_text.replace("，", " ").split() if w.strip()]
+        word_list = [
+            w.strip() for w in keyword_text.replace("，", " ").split() if w.strip()
+        ]
         if not word_list:
             yield event.plain_result("关键词解析失败，请重新输入。")
             return
@@ -232,7 +315,7 @@ class ActivityTracingPlugin(Star):
             keywords=word_list,
             threshold=threshold,
         )
-        self._save_forecast_rules()
+        await self._save_forecast_rules()
         yield event.plain_result(
             "已创建展望未来规则：\n"
             f"- label: {label}\n"
@@ -252,7 +335,7 @@ class ActivityTracingPlugin(Star):
         if not removed:
             yield event.plain_result(f"未找到 label 为 {label} 的规则。")
             return
-        self._save_forecast_rules()
+        await self._save_forecast_rules()
         yield event.plain_result(f"已删除规则 {label}。")
 
     @activity_forecast.command("ls")  # type: ignore [attr-defined]
@@ -336,7 +419,11 @@ class ActivityTracingPlugin(Star):
         lines = ["监听对象："]
         for target_id, state in targets.items():
             total = len(state.records)
-            freshness = self._fmt_delta(now - state.last_updated) if state.last_updated else "未收到发言"
+            freshness = (
+                self._fmt_delta(now - state.last_updated)
+                if state.last_updated
+                else "未收到发言"
+            )
             lines.append(
                 f"- ID {target_id} | 记录 {total} 条 | 最近 {freshness} | 回溯{'✓' if state.backfilled else '×'}",
             )
@@ -398,7 +485,7 @@ class ActivityTracingPlugin(Star):
         start = start_local.replace(tzinfo=local_tz).astimezone(timezone.utc)
         end = start + timedelta(days=1)
 
-        matches = self._query_history_db(
+        matches = await self._query_history_db(
             event.unified_msg_origin,
             target_id,
             start,
@@ -455,14 +542,18 @@ class ActivityTracingPlugin(Star):
             return
 
         time_focus = self._infer_time_focus(raw_question)
-        rag_chunks = self._build_rag_chunks(session_id, target_id, raw_question, time_focus)
+        rag_chunks = self._build_rag_chunks(
+            session_id, target_id, raw_question, time_focus
+        )
         if not rag_chunks:
             yield event.plain_result("暂时没有足够的上下文来回答这个问题。")
             return
 
         coverage = self._describe_coverage(state)
         time_hint = self._format_time_focus(time_focus)
-        rag_context = "\n".join(f"[{chunk['timestamp']}] {chunk['snippet']}" for chunk in rag_chunks)
+        rag_context = "\n".join(
+            f"[{chunk['timestamp']}] {chunk['snippet']}" for chunk in rag_chunks
+        )
         system_prompt = (
             "你是多智能体协同分析器，协调“观察员”“时间线校准员”“推理官”三个视角。"
             "阅读提供的原始片段后，分三步输出："
@@ -520,11 +611,17 @@ class ActivityTracingPlugin(Star):
             history.append(msg)
             seq.append(key)
             if len(history) > self.session_history_limit:
-                removed = history.popleft()
+                history.popleft()
                 removed_key = seq.popleft()
                 hash_set.discard(removed_key)
         hash_set.add(key)
         return True
+
+    def _rebuild_indexes(self, session_id: str, msg: SessionMessage):
+        """根据加载的消息重建哈希索引。"""
+        key = self._hash_message(msg)
+        self.session_hash_sets[session_id].add(key)
+        self.session_hash_sequences[session_id].append(key)
 
     def _hash_message(self, msg: SessionMessage) -> str:
         ts = int(msg.timestamp.timestamp())
@@ -536,9 +633,15 @@ class ActivityTracingPlugin(Star):
         while len(state.records) > self.target_history_limit:
             state.records.popleft()
         state.last_updated = msg.timestamp
-        self._evaluate_forecast_rules(state)
+        asyncio.create_task(self._evaluate_forecast_rules(state))
 
-    def _evaluate_forecast_rules(self, state: TargetState):
+    async def _evaluate_forecast_rules(self, state: TargetState):
+        """
+        评估并触发与目标相关的展望未来规则。
+
+        Args:
+            state: 目标的状态，包含其最近的消息记录。
+        """
         session_rules = self.forecast_rules.get(state.session_id)
         if not session_rules:
             return
@@ -552,14 +655,14 @@ class ActivityTracingPlugin(Star):
             likelihood = self._compute_rule_likelihood(recent, rule.keywords)
             if likelihood >= rule.threshold and self._forecast_cooldown_ok(rule, now):
                 rule.last_triggered = now
-                self._save_forecast_rules()
+                await self._save_forecast_rules()
                 asyncio.create_task(
                     self._dispatch_forecast_alert(rule, state, likelihood, recent[-5:]),
                 )
 
     def _recent_records(
         self,
-        records: Deque[SessionMessage],
+        records: deque[SessionMessage],
         window_hours: int,
         now: datetime,
     ) -> list[SessionMessage]:
@@ -618,39 +721,146 @@ class ActivityTracingPlugin(Star):
         except Exception as exc:
             logger.error(f"发送展望未来告警失败: {exc}")
 
-    def _load_forecast_rules(self):
+    async def _load_forecast_rules(self):
         if not os.path.exists(self.forecast_store_path):
             return
-        try:
-            with open(self.forecast_store_path, encoding="utf-8") as fp:
-                data = json.load(fp)
-        except Exception as exc:
-            logger.error(f"读取展望未来规则失败: {exc}")
+
+        def _read_file():
+            try:
+                with open(self.forecast_store_path, encoding="utf-8") as fp:
+                    return json.load(fp)
+            except (OSError, json.JSONDecodeError) as exc:
+                logger.error(f"读取展望未来规则失败: {exc}")
+                return None
+
+        data = await asyncio.to_thread(_read_file)
+        if data is None:
             return
+
         for session_id, rules in data.items():
             session_map: dict[str, ForecastRule] = {}
             for label, payload in rules.items():
                 try:
                     session_map[label] = ForecastRule.from_dict(payload)
-                except Exception as exc:
+                except (KeyError, TypeError, ValueError) as exc:
                     logger.warning(f"规则 {label} 解析失败: {exc}")
             if session_map:
                 self.forecast_rules[session_id] = session_map
 
-    def _save_forecast_rules(self):
+    async def _save_forecast_rules(self):
         serializable = {
             session_id: {label: rule.to_dict() for label, rule in rules.items()}
             for session_id, rules in self.forecast_rules.items()
             if rules
         }
-        try:
-            os.makedirs(os.path.dirname(self.forecast_store_path), exist_ok=True)
-            with open(self.forecast_store_path, "w", encoding="utf-8") as fp:
-                json.dump(serializable, fp, ensure_ascii=False, indent=2)
-        except Exception as exc:
-            logger.error(f"写入展望未来规则失败: {exc}")
+
+        def _write_file():
+            try:
+                os.makedirs(os.path.dirname(self.forecast_store_path), exist_ok=True)
+                with open(self.forecast_store_path, "w", encoding="utf-8") as fp:
+                    json.dump(serializable, fp, ensure_ascii=False, indent=2)
+            except OSError as exc:
+                logger.error(f"写入展望未来规则失败: {exc}")
+
+        await asyncio.to_thread(_write_file)
+
+    async def _load_tracked_targets(self):
+        if not os.path.exists(self.targets_store_path):
+            return
+
+        def _read_file():
+            try:
+                with open(self.targets_store_path, encoding="utf-8") as f:
+                    return json.load(f)
+            except (OSError, json.JSONDecodeError) as e:
+                logger.error(f"Failed to load tracked targets: {e}")
+                return None
+
+        data = await asyncio.to_thread(_read_file)
+        if not data:
+            return
+
+        for session_id, targets_data in data.items():
+            for target_id, state_data in targets_data.items():
+                try:
+                    self.tracked_targets[session_id][target_id] = TargetState.from_dict(
+                        state_data
+                    )
+                except (KeyError, TypeError) as e:
+                    logger.warning(
+                        f"Failed to parse target state for {target_id} in {session_id}: {e}"
+                    )
+
+    async def _save_tracked_targets(self):
+        serializable = {
+            session_id: {
+                target_id: state.to_dict() for target_id, state in targets.items()
+            }
+            for session_id, targets in self.tracked_targets.items()
+        }
+
+        def _write_file():
+            try:
+                with open(self.targets_store_path, "w", encoding="utf-8") as f:
+                    json.dump(serializable, f, ensure_ascii=False, indent=2)
+            except OSError as e:
+                logger.error(f"Failed to save tracked targets: {e}")
+
+        await asyncio.to_thread(_write_file)
+
+    async def _load_session_histories(self):
+        if not os.path.exists(self.sessions_store_path):
+            return
+
+        def _read_file():
+            try:
+                with open(self.sessions_store_path, encoding="utf-8") as f:
+                    return json.load(f)
+            except (OSError, json.JSONDecodeError) as e:
+                logger.error(f"Failed to load session histories: {e}")
+                return None
+
+        data = await asyncio.to_thread(_read_file)
+        if not data:
+            return
+
+        for session_id, messages_data in data.items():
+            history = deque()
+            for msg_data in messages_data:
+                try:
+                    history.append(SessionMessage.from_dict(msg_data))
+                except (KeyError, TypeError) as e:
+                    logger.warning(
+                        f"Failed to parse session message in {session_id}: {e}"
+                    )
+            self.session_histories[session_id] = history
+
+    async def _save_session_histories(self):
+        serializable = {
+            session_id: [msg.to_dict() for msg in history]
+            for session_id, history in self.session_histories.items()
+        }
+
+        def _write_file():
+            try:
+                with open(self.sessions_store_path, "w", encoding="utf-8") as f:
+                    json.dump(serializable, f, ensure_ascii=False, indent=2)
+            except OSError as e:
+                logger.error(f"Failed to save session histories: {e}")
+
+        await asyncio.to_thread(_write_file)
 
     async def _backfill_session_history(self, session_id: str, platform_id: str) -> int:
+        """
+        从平台提供的历史消息存档中回填会话历史。
+
+        Args:
+            session_id: 会话 ID。
+            platform_id: 平台 ID。
+
+        Returns:
+            成功导入并追加到内存中的消息数量。
+        """
         mgr = getattr(self.context, "message_history_manager", None)
         if not mgr:
             return 0
@@ -700,6 +910,7 @@ class ActivityTracingPlugin(Star):
         return appended
 
     def _extract_text_from_history_content(self, content: Any) -> str:
+        """从复杂的消息历史记录内容中安全地提取纯文本。"""
         if not content:
             return ""
         if isinstance(content, str):
@@ -711,17 +922,23 @@ class ActivityTracingPlugin(Star):
                 return content["text"]
             if isinstance(content.get("chain"), list):
                 return self._extract_text_from_history_content(content["chain"])
+            return ""  # 如果字典格式不匹配，返回空字符串
+
         if isinstance(content, list):
             parts = []
             for item in content:
-                if isinstance(item, dict):
-                    if item.get("type") == "Plain":
-                        parts.append(item.get("text", ""))
-                    elif "message" in item:
-                        parts.append(str(item["message"]))
-                elif isinstance(item, str):
-                    parts.append(item)
-            return " ".join(parts)
+                try:
+                    if isinstance(item, dict):
+                        if item.get("type") == "Plain" and "text" in item:
+                            parts.append(str(item["text"]))
+                        elif "message" in item:
+                            parts.append(str(item["message"]))
+                    elif isinstance(item, str):
+                        parts.append(item)
+                except (TypeError, KeyError):
+                    # 忽略无法解析的片段
+                    continue
+            return " ".join(filter(None, parts))
         return ""
 
     def _reindex_target(self, state: TargetState) -> int:
@@ -773,25 +990,38 @@ class ActivityTracingPlugin(Star):
         return self.tracked_targets.get(session_id, {}).get(target_id)
 
     def _build_snapshot(self, records: list[SessionMessage], window_hours: int) -> str:
+        if not records:
+            return "记录为空，无法生成快照。"
+
         count = len(records)
         first = records[0].timestamp
         last = records[-1].timestamp
-        question_count = sum(1 for msg in records if msg.content.endswith("?") or msg.content.endswith("？"))
+        sender_name = records[0].sender_name or "未知用户"
+
+        question_count = sum(
+            1
+            for msg in records
+            if msg.content.endswith("?") or msg.content.endswith("？")
+        )
         pos_hits = self._count_hits(records, self.positive_keywords)
         neg_hits = self._count_hits(records, self.negative_keywords)
         topics = self._count_hits(records, self.activity_keywords)
+
         lines = [
-            f"【{records[0].sender_name}】最近 {window_hours} 小时快照",
+            f"【{sender_name}】最近 {window_hours} 小时快照",
             f"- 发言：{count} 条（{self._fmt_ts(first)} ~ {self._fmt_ts(last)}）",
             f"- 提问密度：{question_count} 条 / {count} 条",
             f"- 情绪：{self._describe_emotion(pos_hits, neg_hits)}",
             f"- 动作信号：{self._format_hits(topics)}",
         ]
-        if records[-1].content:
-            last_excerpt = records[-1].content
+
+        last_content = records[-1].content
+        if last_content:
+            last_excerpt = last_content
             if len(last_excerpt) > 60:
                 last_excerpt = last_excerpt[:60] + "..."
             lines.append(f"- 最新一句：{last_excerpt}")
+
         return "\n".join(lines)
 
     def _count_hits(self, records: Iterable[SessionMessage], keywords: list[str]):
@@ -831,7 +1061,7 @@ class ActivityTracingPlugin(Star):
         top = sorted(counter.items(), key=lambda kv: kv[1], reverse=True)[:3]
         return ", ".join(f"{k}×{v}" for k, v in top)
 
-    def _query_history_db(
+    async def _query_history_db(
         self,
         session_id: str,
         target_id: str,
@@ -842,37 +1072,38 @@ class ActivityTracingPlugin(Star):
     ) -> list[dict]:
         if not os.path.exists(self.history_db_path):
             return []
-        try:
-            conn = sqlite3.connect(self.history_db_path)
-            conn.row_factory = sqlite3.Row
-        except sqlite3.Error as exc:
-            logger.error(f"无法读取历史索引库: {exc}")
-            return []
-        try:
-            cursor = conn.execute(
-                """
-                SELECT message_text, created_at
-                FROM messages
-                WHERE session_id = ?
-                  AND sender_id = ?
-                  AND created_at >= ?
-                  AND created_at < ?
-                  AND lower(message_text) LIKE ?
-                ORDER BY created_at ASC
-                LIMIT ?
-                """,
-                (
-                    session_id,
-                    target_id,
-                    int(start.timestamp()),
-                    int(end.timestamp()),
-                    f"%{keyword.lower()}%",
-                    limit,
-                ),
-            )
-            rows = cursor.fetchall()
-        finally:
-            conn.close()
+
+        def _db_operation():
+            try:
+                with sqlite3.connect(self.history_db_path) as conn:
+                    conn.row_factory = sqlite3.Row
+                    cursor = conn.execute(
+                        """
+                        SELECT message_text, created_at
+                        FROM messages
+                        WHERE session_id = ?
+                          AND sender_id = ?
+                          AND created_at >= ?
+                          AND created_at < ?
+                          AND lower(message_text) LIKE ?
+                        ORDER BY created_at ASC
+                        LIMIT ?
+                        """,
+                        (
+                            session_id,
+                            target_id,
+                            int(start.timestamp()),
+                            int(end.timestamp()),
+                            f"%{keyword.lower()}%",
+                            limit,
+                        ),
+                    )
+                    return cursor.fetchall()
+            except sqlite3.Error as exc:
+                logger.error(f"无法读取历史索引库: {exc}")
+                return []
+
+        rows = await asyncio.to_thread(_db_operation)
         return [
             {
                 "timestamp": datetime.fromtimestamp(row["created_at"], tz=timezone.utc),
@@ -899,6 +1130,15 @@ class ActivityTracingPlugin(Star):
         self,
         question: str,
     ) -> tuple[datetime, datetime | None, str] | None:
+        """
+        从问题中推断时间焦点（如“今天”、“昨天”）。
+
+        Args:
+            question: 用户提出的原始问题。
+
+        Returns:
+            一个元组，包含时间范围的开始、结束（可选）和标签，如果未检测到则返回 None。
+        """
         now = self._now().astimezone()
         today_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
         tokens = question.lower()
@@ -926,6 +1166,20 @@ class ActivityTracingPlugin(Star):
         question: str,
         time_focus: tuple[datetime, datetime | None, str] | None,
     ) -> list[dict]:
+        """
+        构建用于 RAG（检索增强生成）的上下文片段。
+
+        通过对会话历史进行评分和排序，选取与问题最相关的消息片段。
+
+        Args:
+            session_id: 当前会话 ID。
+            target_id: 目标用户 ID。
+            question: 用户提出的问题。
+            time_focus: 从问题中推断出的时间焦点。
+
+        Returns:
+            一个按相关性排序的字典列表，每个字典包含分数、时间戳和消息片段。
+        """
         history = list(self.session_histories.get(session_id, []))
         if not history:
             return []
@@ -942,9 +1196,12 @@ class ActivityTracingPlugin(Star):
             score = self._score_message(msg, tokens, focus_center, time_focus)
             if score <= 0:
                 continue
-            snippet_records = self._collect_context_window(history, idx, self.context_span)
+            snippet_records = self._collect_context_window(
+                history, idx, self.context_span
+            )
             snippet = "\n".join(
-                f"{self._fmt_ts(rec.timestamp)} {rec.sender_name}: {rec.content}" for rec in snippet_records
+                f"{self._fmt_ts(rec.timestamp)} {rec.sender_name}: {rec.content}"
+                for rec in snippet_records
             )
             scored.append(
                 {
@@ -968,7 +1225,11 @@ class ActivityTracingPlugin(Star):
                     current = []
         if current:
             tokens.append("".join(current))
-        bigrams = {text[i : i + 2] for i in range(len(text) - 1) if self._is_cjk(text[i]) and self._is_cjk(text[i + 1])}
+        bigrams = {
+            text[i : i + 2]
+            for i in range(len(text) - 1)
+            if self._is_cjk(text[i]) and self._is_cjk(text[i + 1])
+        }
         return tokens + list(bigrams)
 
     def _is_token_char(self, ch: str) -> bool:
@@ -984,6 +1245,20 @@ class ActivityTracingPlugin(Star):
         focus_center: datetime,
         time_focus: tuple[datetime, datetime | None, str] | None,
     ) -> float:
+        """
+        根据与问题的相关性为单条消息评分。
+
+        评分综合考虑了关键词匹配度和时间接近度。
+
+        Args:
+            msg: 待评分的消息。
+            tokens: 从问题中提取的关键词和二元组。
+            focus_center: 时间焦点的中心点。
+            time_focus: 推断出的时间范围。
+
+        Returns:
+            消息的相关性分数。
+        """
         if not msg.content:
             return 0.0
         token_hits = sum(1 for tk in tokens if tk and tk in msg.content)
@@ -1015,14 +1290,17 @@ class ActivityTracingPlugin(Star):
         return history[start:end]
 
     def _describe_coverage(self, state: TargetState) -> str:
-        if not state.records:
+        if not state or not state.records:
             return "尚无个人记录"
-        first = state.records[0].timestamp
-        last = state.records[-1].timestamp
-        return (
-            f"{len(state.records)} 条，时间跨度 {self._fmt_ts(first)} ~ {self._fmt_ts(last)}，"
-            f"最近 {self._fmt_delta(self._now() - last)}更新"
-        )
+        try:
+            first = state.records[0].timestamp
+            last = state.records[-1].timestamp
+            return (
+                f"{len(state.records)} 条，时间跨度 {self._fmt_ts(first)} ~ {self._fmt_ts(last)}，"
+                f"最近 {self._fmt_delta(self._now() - last)}更新"
+            )
+        except IndexError:
+            return "记录为空，无法描述覆盖范围。"
 
     def _format_time_focus(
         self,
